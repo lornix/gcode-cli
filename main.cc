@@ -11,9 +11,6 @@
 
 #include "machine-connection.h"
 
-#define ALERT_ON "\033[41m\033[30m"
-#define ALERT_OFF "\033[0m"
-
 static bool reliable_write(int fd, const char *buffer, int len) {
     while (len) {
         int w = write(fd, buffer, len);
@@ -49,7 +46,7 @@ static int usage(const char *progname) {
             "%s file.gcode /dev/ttyACM0,b115200\n"
             "%s file.gcode localhost:4444\n",
             progname, progname);
-    return 1;
+    return EXIT_FAILURE;
 }
 
 int main(int argc, char *argv[]) {
@@ -57,26 +54,39 @@ int main(int argc, char *argv[]) {
         return usage(argv[0]);
 
     const char *const filename = argv[1];
-    std::fstream input(filename);
+    std::ifstream input(filename);
 
-    const char *connect_str = (argc >= 3) ? argv[2] : "/dev/ttyACM0,b115200";
+    // quick peek to get length of input
+    input.seekg(0, input.end);
+    // add 1 to prevent div/0 possibility.  You won't notice, honest!
+    // yes, integer math.  No need to pull in floating point library.
+    const int input_length = ( input.tellg() / 100 ) + 1;
+    input.seekg(0, input.beg);
+
+    // make number formatting work (thousands separators)
+    setlocale(LC_NUMERIC,"");
+
+    const char *connect_str = (argc >= 3) ? argv[2] : "/dev/ttyUSB0,b115200";
     const int machine_fd = OpenMachineConnection(connect_str);
     if (machine_fd < 0) {
         fprintf(stderr, "Failed to connect to machine %s\n", connect_str);
         return 1;
     }
 
-    DiscardPendingInput(machine_fd, 3000);
+    const int DISCARDWAITMS = 1000;
+    DiscardPendingInput(machine_fd, DISCARDWAITMS);
 
-    fprintf(stderr, "\n---- Start sending file '%s' -----\n", filename);
     std::string line;
-    int line_no = 0;
+    int line_count = 0;
     int lines_sent = 0;
+
     while (!input.eof()) {
-        line_no++;
         getline(input, line);
+        line_count++;
 
         // Strip any comments that start with ; to the end of the line
+        // (lornix) This can cause issues if you echo a message (M118)
+        // containing a semi-colon!
         const size_t comment_start = line.find_first_of(';');
         if (comment_start != std::string::npos) {
             line.resize(comment_start);
@@ -92,26 +102,31 @@ int main(int argc, char *argv[]) {
             continue;
         }
 
-        fprintf(stderr, "%4d| %s ", line_no, line.c_str());
-        fflush(stderr);
+        int percent_complete = input.tellg() / input_length;
+        printf("(%02d%%) %'8d | %s", percent_complete, line_count, line.c_str());
+        fflush(stdout);
         line.append("\n");  // GRBL wants only newline, not CRLF
+
         if (!reliable_write(machine_fd, line.data(), line.length())) {
-            fprintf(stderr, "Couldn't write!\n");
-            return 1;
+            fprintf(stderr, "Send error!\n");
+            return EXIT_FAILURE;
         }
+
+        printf("\n");
+        fflush(stdout);
 
         lines_sent++;
 
         // The OK 'flow control' used by all these serial machine controls
         if (!WaitForOkAck(machine_fd)) {
-            fprintf(stderr,
-                    ALERT_ON "[ Didn't get OK. Continue: ENTER; stop: CTRL-C ]"
-                    ALERT_OFF "\n");
+            fprintf(stderr, "[ Error Response. CTRL-C to stop ]\n");
             getchar();
-        } else {
-            fprintf(stderr, "<< OK\n");
         }
     }
+
     close(machine_fd);
-    fprintf(stderr, "Sent total of %d non-empty lines\n", lines_sent);
+
+    printf("Sent %d non-empty lines out of %d total\n", lines_sent, line_count);
+
+    return EXIT_SUCCESS;
 }

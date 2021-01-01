@@ -63,7 +63,7 @@ static bool SetTTYParams(int fd, const char *params) {
     tty.c_cc[VTIME] = 1;
 
     if (tcsetattr(fd, TCSANOW, &tty) != 0) {
-        printf("Error from tcsetattr: %s\n", strerror(errno));
+        fprintf(stderr, "Error from tcsetattr: %s\n", strerror(errno));
         return false;
     }
     return true;
@@ -92,16 +92,21 @@ static int AwaitReadReady(int fd, int timeout_millis) {
 
 static int ReadLine(int fd, char *result, int len, bool do_echo) {
     int bytes_read = 0;
-    char c = 0;
-    while (c != '\n' && c != '\r' && bytes_read < len) {
-        if (read(fd, &c, 1) < 0)
-            return -1;
-        ++bytes_read;
-        *result++ = c;
-        if (do_echo) write(STDERR_FILENO, &c, 1);  // echo back.
+    // reserve space for ending \0
+    --len;
+    // Anything <= 0 is an error
+    while (read(fd, result, 1) > 0) {
+        if (do_echo) {
+            write(STDOUT_FILENO, result, 1);  // echo back.
+        }
+        if ((*result == '\n') || (*result == '\r') || (bytes_read >= len)) {
+            *result=0;
+            return bytes_read;
+        }
+        result++;
+        bytes_read++;
     }
-    *result = '\0';
-    return bytes_read;
+    return -1;
 }
 
 /*
@@ -174,49 +179,43 @@ int DiscardPendingInput(int fd, int timeout_ms) {
     int total_bytes = 0;
     char buf[128];
     while (AwaitReadReady(fd, timeout_ms) > 0) {
-        int r = read(fd, buf, sizeof(buf));
+        // remember to leave room for \0 terminator
+        int r = read(fd, buf, sizeof(buf)-1);
         if (r < 0) {
             perror("reading trouble");
             return -1;
         }
         total_bytes += r;
-        if (r > 0) write(STDERR_FILENO, buf, r);  // echo back.
+        if (r > 0) {
+            // echo discarded output
+            buf[r]=0;
+            fprintf(stderr,"DISCARD: %s\n", buf);
+        }
     }
     return total_bytes;
 }
 
-// 'ok' comes on a single line, maybe followed by something.
+// 'ok' begins a single line, maybe followed by something.
 bool WaitForOkAck(int fd) {
     char buffer[512] = {};
-    int lines_printed = 0;
     for (;;) {
         int got_chars = ReadLine(fd, buffer, sizeof(buffer), false);
         if (got_chars < 0) {
-            fprintf(stderr, "\n--> got EOF <-- \n");
+            fprintf(stderr, "\n--> RESPONSE ERROR <--\n");
             return false;
         }
-
-        if (got_chars == 1 && (buffer[0] == '\r' || buffer[0] == '\n'))
-            continue;  // Just some random newline.
 
         if (got_chars >= 2 && strncasecmp(buffer, "ok", 2) == 0) {
             return true;
         }
 
-        // Got some form of other message. Remove newlines and print.
-        buffer[got_chars-1] = '\0';
-        while (got_chars && isspace(buffer[got_chars-1])) {
-            buffer[got_chars-1] = '\0';
-            got_chars--;
-        }
-        if (lines_printed == 0) fprintf(stderr, "\n");
-        // If we didn't get 'ok', it might be an important error message. Print.
-        fprintf(stderr, "\033[7m%s\033[0m\n", buffer);
-        ++lines_printed;
-
-        // If the message indeed starts with 'error', we can return. Otherwise
-        // we keep sending stuff.
-        if (got_chars >= 5 && strncasecmp(buffer, "error", 5) == 0) {
+        // look for definite error returns, everything else is ignorable
+        if ( ((got_chars >= 2) && (strncasecmp(buffer, "rs", 2) == 0))
+            || ((got_chars >= 2) && (strncasecmp(buffer, "!!", 2) == 0))
+            || ((got_chars >= 5) && (strncasecmp(buffer, "error", 5) == 0))
+            || ((got_chars >= 5) && (strncasecmp(buffer, "fatal", 5) == 0))
+            || ((got_chars >= 6) && (strncasecmp(buffer, "resend", 6) == 0)) ) {
+            fprintf(stderr, "%s\n", buffer);
             return false;
         }
     }
